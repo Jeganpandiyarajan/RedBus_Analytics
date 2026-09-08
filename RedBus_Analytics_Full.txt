@@ -1,0 +1,702 @@
+/* ============================================================
+   REDBUS ANALYTICS - FULL SNOWFLAKE BUILD SCRIPT
+   Project: RedBus (Bus Booking) Analytics Platform
+   ============================================================
+
+   TABLE OF CONTENTS:
+   1. Setup (Warehouse, Database, Schemas)
+   2. File Format & Stage
+   3. Raw Tables (Bronze Layer)
+   4. Dimension Tables (Silver Layer)
+      - DIM_DATE
+      - DIM_ROUTE (Type 1)
+      - DIM_CUSTOMER (SCD Type 2)
+      - DIM_BUS (SCD Type 2)
+   5. Fact Table (Silver Layer)
+      - FACT_BOOKING
+   6. Data Quality & Audit
+      - LOAD_AUDIT
+   7. Semantic Views (Gold Layer)
+      - VW_BOOKING_DETAILS
+      - VW_CUSTOMER
+      - VW_BUS
+      - VW_ROUTE
+      - VW_DATE
+      - VW_BOOKINGS
+   8. Policy Search (RAG)
+      - POLICY_DOCS
+      - SEARCH_POLICY function
+   9. Streamlit Dashboard (Python code referenced)
+   ============================================================ */
+
+
+/* ============================================================
+   STEP 1: SETUP - Warehouse, Database, Schemas
+   ============================================================ */
+
+CREATE WAREHOUSE IF NOT EXISTS REDBUS_WH
+  WAREHOUSE_SIZE = 'X-SMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+CREATE DATABASE IF NOT EXISTS REDBUS_ANALYTICS;
+
+USE DATABASE REDBUS_ANALYTICS;
+
+CREATE SCHEMA IF NOT EXISTS RAW;
+CREATE SCHEMA IF NOT EXISTS DW;
+CREATE SCHEMA IF NOT EXISTS OPS;
+CREATE SCHEMA IF NOT EXISTS SEMANTIC;
+
+USE WAREHOUSE REDBUS_WH;
+
+
+/* ============================================================
+   STEP 2: FILE FORMAT & STAGE
+   ============================================================ */
+
+USE SCHEMA RAW;
+
+CREATE OR REPLACE FILE FORMAT RAW.CSV_FF
+  TYPE = 'CSV'
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  TRIM_SPACE = TRUE
+  NULL_IF = ('', 'NULL')
+  EMPTY_FIELD_AS_NULL = TRUE;
+
+CREATE OR REPLACE STAGE RAW.REDBUS_STAGE
+  FILE_FORMAT = RAW.CSV_FF;
+
+
+/* ============================================================
+   STEP 3: RAW TABLES (Bronze Layer)
+   ============================================================ */
+
+CREATE OR REPLACE TABLE RAW.RAW_CUSTOMERS (
+  CUSTOMER_ID       STRING,
+  FIRST_NAME        STRING,
+  LAST_NAME         STRING,
+  EMAIL             STRING,
+  PHONE             STRING,
+  SEGMENT           STRING,
+  CITY              STRING,
+  STATE             STRING,
+  COUNTRY           STRING,
+  LOAD_TS           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  SOURCE_FILE_NAME  STRING
+);
+
+CREATE OR REPLACE TABLE RAW.RAW_ROUTES (
+  ROUTE_ID          STRING,
+  SOURCE_CITY       STRING,
+  DEST_CITY         STRING,
+  DISTANCE_KM       NUMBER,
+  SOURCE_STATE      STRING,
+  DEST_STATE        STRING,
+  REGION            STRING,
+  EFFECTIVE_FROM    DATE,
+  STATUS            STRING,
+  LOAD_TS           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  SOURCE_FILE_NAME  STRING
+);
+
+CREATE OR REPLACE TABLE RAW.RAW_BUSES (
+  BUS_ID            STRING,
+  OPERATOR_NAME     STRING,
+  BUS_TYPE          STRING,
+  SEAT_CAPACITY     NUMBER,
+  BUS_MODEL         STRING,
+  REGISTRATION_NO   STRING,
+  IN_SERVICE_DATE   DATE,
+  STATUS            STRING,
+  LOAD_TS           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  SOURCE_FILE_NAME  STRING
+);
+
+CREATE OR REPLACE TABLE RAW.RAW_BOOKINGS (
+  BOOKING_ID        STRING,
+  BOOKING_LINE_ID   NUMBER,
+  BOOKING_DATE      DATE,
+  CUSTOMER_ID       STRING,
+  ROUTE_ID          STRING,
+  BUS_ID            STRING,
+  JOURNEY_DATE      DATE,
+  DEPARTURE_TIME    STRING,
+  ARRIVAL_TIME      STRING,
+  SEAT_TYPE         STRING,
+  SEAT_NO           STRING,
+  PASSENGER_COUNT   NUMBER,
+  FARE_AMOUNT       NUMBER(10,2),
+  DISCOUNT_PCT      NUMBER(5,2),
+  PAYMENT_MODE      STRING,
+  BOOKING_STATUS    STRING,
+  LOAD_TS           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  SOURCE_FILE_NAME  STRING
+);
+
+-- Verify row counts after loading CSVs
+SELECT 'RAW_CUSTOMERS' AS TABLE_NAME, COUNT(*) AS ROW_COUNT FROM RAW.RAW_CUSTOMERS
+UNION ALL SELECT 'RAW_ROUTES', COUNT(*) FROM RAW.RAW_ROUTES
+UNION ALL SELECT 'RAW_BUSES', COUNT(*) FROM RAW.RAW_BUSES
+UNION ALL SELECT 'RAW_BOOKINGS', COUNT(*) FROM RAW.RAW_BOOKINGS;
+
+
+/* ============================================================
+   STEP 4: DIM_DATE - Calendar Dimension
+   ============================================================ */
+
+USE SCHEMA DW;
+
+CREATE OR REPLACE TABLE DW.DIM_DATE (
+  SK_DATE       NUMBER PRIMARY KEY,
+  DATE_VALUE    DATE,
+  YEAR          NUMBER,
+  QUARTER       NUMBER,
+  MONTH         NUMBER,
+  MONTH_NAME    STRING,
+  WEEK_OF_YEAR  NUMBER,
+  DAY_OF_WEEK   NUMBER,
+  DAY_NAME      STRING,
+  IS_WEEKEND    BOOLEAN
+);
+
+INSERT INTO DW.DIM_DATE
+SELECT
+  TO_NUMBER(TO_CHAR(D, 'YYYYMMDD')) AS SK_DATE,
+  D AS DATE_VALUE,
+  YEAR(D) AS YEAR,
+  QUARTER(D) AS QUARTER,
+  MONTH(D) AS MONTH,
+  MONTHNAME(D) AS MONTH_NAME,
+  WEEKOFYEAR(D) AS WEEK_OF_YEAR,
+  DAYOFWEEK(D) AS DAY_OF_WEEK,
+  DAYNAME(D) AS DAY_NAME,
+  CASE WHEN DAYOFWEEK(D) IN (0,6) THEN TRUE ELSE FALSE END AS IS_WEEKEND
+FROM (
+  SELECT DATEADD(DAY, SEQ4(), '2020-01-01') AS D
+  FROM TABLE(GENERATOR(ROWCOUNT => 2922))
+);
+
+
+/* ============================================================
+   STEP 5: DIM_ROUTE - Type 1 Dimension
+   ============================================================ */
+
+CREATE OR REPLACE TABLE DW.DIM_ROUTE (
+  SK_ROUTE        NUMBER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY,
+  ROUTE_ID        STRING,
+  SOURCE_CITY     STRING,
+  DEST_CITY       STRING,
+  DISTANCE_KM     NUMBER,
+  SOURCE_STATE    STRING,
+  DEST_STATE      STRING,
+  REGION          STRING,
+  EFFECTIVE_FROM  DATE,
+  STATUS          STRING,
+  LOAD_TS         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+MERGE INTO DW.DIM_ROUTE AS TGT
+USING RAW.RAW_ROUTES AS SRC
+ON TGT.ROUTE_ID = SRC.ROUTE_ID
+WHEN MATCHED THEN UPDATE SET
+  SOURCE_CITY     = SRC.SOURCE_CITY,
+  DEST_CITY       = SRC.DEST_CITY,
+  DISTANCE_KM     = SRC.DISTANCE_KM,
+  SOURCE_STATE    = SRC.SOURCE_STATE,
+  DEST_STATE      = SRC.DEST_STATE,
+  REGION          = SRC.REGION,
+  EFFECTIVE_FROM  = SRC.EFFECTIVE_FROM,
+  STATUS          = SRC.STATUS,
+  LOAD_TS         = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  ROUTE_ID, SOURCE_CITY, DEST_CITY, DISTANCE_KM,
+  SOURCE_STATE, DEST_STATE, REGION, EFFECTIVE_FROM, STATUS, LOAD_TS
+) VALUES (
+  SRC.ROUTE_ID, SRC.SOURCE_CITY, SRC.DEST_CITY, SRC.DISTANCE_KM,
+  SRC.SOURCE_STATE, SRC.DEST_STATE, SRC.REGION,
+  SRC.EFFECTIVE_FROM, SRC.STATUS, CURRENT_TIMESTAMP()
+);
+
+
+/* ============================================================
+   STEP 6: DIM_CUSTOMER - SCD Type 2
+   ============================================================ */
+
+CREATE OR REPLACE TABLE DW.DIM_CUSTOMER (
+  SK_CUSTOMER   NUMBER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY,
+  CUSTOMER_ID   STRING,
+  FIRST_NAME    STRING,
+  LAST_NAME     STRING,
+  EMAIL         STRING,
+  PHONE         STRING,
+  SEGMENT       STRING,
+  CITY          STRING,
+  STATE         STRING,
+  COUNTRY       STRING,
+  HASH_DIFF     STRING,
+  EFF_START_TS  TIMESTAMP_NTZ,
+  EFF_END_TS    TIMESTAMP_NTZ,
+  IS_CURRENT    BOOLEAN
+);
+
+INSERT INTO DW.DIM_CUSTOMER (
+  CUSTOMER_ID, FIRST_NAME, LAST_NAME, EMAIL, PHONE,
+  SEGMENT, CITY, STATE, COUNTRY,
+  HASH_DIFF, EFF_START_TS, EFF_END_TS, IS_CURRENT
+)
+SELECT
+  CUSTOMER_ID, FIRST_NAME, LAST_NAME, EMAIL, PHONE,
+  SEGMENT, CITY, STATE, COUNTRY,
+  MD5(CONCAT_WS('|', FIRST_NAME, LAST_NAME, EMAIL, PHONE,
+                SEGMENT, CITY, STATE, COUNTRY)) AS HASH_DIFF,
+  CURRENT_TIMESTAMP() AS EFF_START_TS,
+  '9999-12-31'::TIMESTAMP_NTZ AS EFF_END_TS,
+  TRUE AS IS_CURRENT
+FROM RAW.RAW_CUSTOMERS;
+
+
+/* ============================================================
+   STEP 7: DIM_BUS - SCD Type 2
+   ============================================================ */
+
+CREATE OR REPLACE TABLE DW.DIM_BUS (
+  SK_BUS           NUMBER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY,
+  BUS_ID           STRING,
+  OPERATOR_NAME    STRING,
+  BUS_TYPE         STRING,
+  SEAT_CAPACITY    NUMBER,
+  BUS_MODEL        STRING,
+  REGISTRATION_NO  STRING,
+  STATUS           STRING,
+  HASH_DIFF        STRING,
+  EFF_START_TS     TIMESTAMP_NTZ,
+  EFF_END_TS       TIMESTAMP_NTZ,
+  IS_CURRENT       BOOLEAN
+);
+
+INSERT INTO DW.DIM_BUS (
+  BUS_ID, OPERATOR_NAME, BUS_TYPE, SEAT_CAPACITY,
+  BUS_MODEL, REGISTRATION_NO, STATUS,
+  HASH_DIFF, EFF_START_TS, EFF_END_TS, IS_CURRENT
+)
+SELECT
+  BUS_ID, OPERATOR_NAME, BUS_TYPE, SEAT_CAPACITY,
+  BUS_MODEL, REGISTRATION_NO, STATUS,
+  MD5(CONCAT_WS('|', OPERATOR_NAME, BUS_TYPE,
+                SEAT_CAPACITY::STRING, BUS_MODEL,
+                REGISTRATION_NO, STATUS)) AS HASH_DIFF,
+  CURRENT_TIMESTAMP() AS EFF_START_TS,
+  '9999-12-31'::TIMESTAMP_NTZ AS EFF_END_TS,
+  TRUE AS IS_CURRENT
+FROM RAW.RAW_BUSES;
+
+
+/* ============================================================
+   STEP 8: FACT_BOOKING - Fact Table
+   Grain: One row per booking line (BOOKING_ID + BOOKING_LINE_ID)
+   ============================================================ */
+
+CREATE OR REPLACE TABLE DW.FACT_BOOKING (
+  BOOKING_ID        STRING,
+  BOOKING_LINE_ID   NUMBER,
+  SK_BOOKING_DATE   NUMBER,
+  SK_JOURNEY_DATE   NUMBER,
+  SK_CUSTOMER       NUMBER,
+  SK_ROUTE          NUMBER,
+  SK_BUS            NUMBER,
+  DEPARTURE_TIME    STRING,
+  ARRIVAL_TIME      STRING,
+  SEAT_TYPE         STRING,
+  SEAT_NO           STRING,
+  PASSENGER_COUNT   NUMBER,
+  FARE_AMOUNT       NUMBER(10,2),
+  DISCOUNT_PCT      NUMBER(5,2),
+  NET_AMOUNT        NUMBER(10,2),
+  PAYMENT_MODE      STRING,
+  BOOKING_STATUS    STRING,
+  LOAD_TS           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  PRIMARY KEY (BOOKING_ID, BOOKING_LINE_ID)
+);
+
+INSERT INTO DW.FACT_BOOKING (
+  BOOKING_ID, BOOKING_LINE_ID,
+  SK_BOOKING_DATE, SK_JOURNEY_DATE,
+  SK_CUSTOMER, SK_ROUTE, SK_BUS,
+  DEPARTURE_TIME, ARRIVAL_TIME, SEAT_TYPE, SEAT_NO,
+  PASSENGER_COUNT, FARE_AMOUNT, DISCOUNT_PCT, NET_AMOUNT,
+  PAYMENT_MODE, BOOKING_STATUS
+)
+SELECT
+  B.BOOKING_ID,
+  B.BOOKING_LINE_ID,
+  TO_NUMBER(TO_CHAR(B.BOOKING_DATE, 'YYYYMMDD')) AS SK_BOOKING_DATE,
+  TO_NUMBER(TO_CHAR(B.JOURNEY_DATE, 'YYYYMMDD')) AS SK_JOURNEY_DATE,
+  COALESCE(C.SK_CUSTOMER, -1) AS SK_CUSTOMER,
+  COALESCE(R.SK_ROUTE, -1) AS SK_ROUTE,
+  COALESCE(BU.SK_BUS, -1) AS SK_BUS,
+  B.DEPARTURE_TIME,
+  B.ARRIVAL_TIME,
+  B.SEAT_TYPE,
+  B.SEAT_NO,
+  B.PASSENGER_COUNT,
+  B.FARE_AMOUNT,
+  B.DISCOUNT_PCT,
+  ROUND(B.FARE_AMOUNT * B.PASSENGER_COUNT * (1 - B.DISCOUNT_PCT/100), 2) AS NET_AMOUNT,
+  B.PAYMENT_MODE,
+  B.BOOKING_STATUS
+FROM RAW.RAW_BOOKINGS B
+LEFT JOIN DW.DIM_CUSTOMER C ON B.CUSTOMER_ID = C.CUSTOMER_ID AND C.IS_CURRENT = TRUE
+LEFT JOIN DW.DIM_ROUTE R ON B.ROUTE_ID = R.ROUTE_ID
+LEFT JOIN DW.DIM_BUS BU ON B.BUS_ID = BU.BUS_ID AND BU.IS_CURRENT = TRUE;
+
+-- Verify fact table row count
+SELECT COUNT(*) AS FACT_ROW_COUNT FROM DW.FACT_BOOKING;
+
+-- Check for unmatched dimension keys (should return 0)
+SELECT COUNT(*) AS UNMATCHED_KEYS
+FROM DW.FACT_BOOKING
+WHERE SK_CUSTOMER = -1 OR SK_ROUTE = -1 OR SK_BUS = -1;
+
+
+/* ============================================================
+   STEP 9: DATA QUALITY & AUDIT
+   ============================================================ */
+
+USE SCHEMA OPS;
+
+CREATE OR REPLACE TABLE OPS.LOAD_AUDIT (
+  AUDIT_ID       NUMBER AUTOINCREMENT START 1 INCREMENT 1 PRIMARY KEY,
+  TABLE_NAME     STRING,
+  ROWS_LOADED    NUMBER,
+  LOAD_TS        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  STATUS         STRING,
+  REMARKS        STRING
+);
+
+INSERT INTO OPS.LOAD_AUDIT (TABLE_NAME, ROWS_LOADED, STATUS, REMARKS)
+SELECT 'RAW_CUSTOMERS', COUNT(*), 'SUCCESS', 'Initial load' FROM RAW.RAW_CUSTOMERS
+UNION ALL SELECT 'RAW_ROUTES', COUNT(*), 'SUCCESS', 'Initial load' FROM RAW.RAW_ROUTES
+UNION ALL SELECT 'RAW_BUSES', COUNT(*), 'SUCCESS', 'Initial load' FROM RAW.RAW_BUSES
+UNION ALL SELECT 'RAW_BOOKINGS', COUNT(*), 'SUCCESS', 'Initial load' FROM RAW.RAW_BOOKINGS
+UNION ALL SELECT 'DIM_DATE', COUNT(*), 'SUCCESS', 'Initial load' FROM DW.DIM_DATE
+UNION ALL SELECT 'DIM_ROUTE', COUNT(*), 'SUCCESS', 'Initial load' FROM DW.DIM_ROUTE
+UNION ALL SELECT 'DIM_CUSTOMER', COUNT(*), 'SUCCESS', 'SCD2 initial load' FROM DW.DIM_CUSTOMER
+UNION ALL SELECT 'DIM_BUS', COUNT(*), 'SUCCESS', 'SCD2 initial load' FROM DW.DIM_BUS
+UNION ALL SELECT 'FACT_BOOKING', COUNT(*), 'SUCCESS', 'Initial load' FROM DW.FACT_BOOKING;
+
+-- Reconciliation: RAW vs DW counts
+SELECT
+  (SELECT COUNT(*) FROM RAW.RAW_BOOKINGS) AS RAW_BOOKING_COUNT,
+  (SELECT COUNT(*) FROM DW.FACT_BOOKING) AS DW_BOOKING_COUNT;
+
+-- Business metric: Cancellation Rate
+SELECT
+  ROUND(100.0 * SUM(CASE WHEN BOOKING_STATUS = 'CANCELLED' THEN 1 ELSE 0 END) / COUNT(*), 2) AS CANCELLATION_RATE_PCT
+FROM DW.FACT_BOOKING;
+
+
+/* ============================================================
+   STEP 10: SEMANTIC VIEWS (Gold Layer)
+   ============================================================ */
+
+USE SCHEMA SEMANTIC;
+
+-- Customer View
+CREATE OR REPLACE VIEW SEMANTIC.VW_CUSTOMER AS
+SELECT
+  CUSTOMER_SK,
+  CUSTOMER_ID,
+  FIRST_NAME,
+  LAST_NAME,
+  CONCAT(FIRST_NAME, ' ', LAST_NAME) AS FULL_NAME,
+  EMAIL,
+  PHONE,
+  SEGMENT,
+  CITY,
+  STATE,
+  COUNTRY,
+  CASE
+    WHEN SEGMENT = 'PREMIUM' THEN 'High Value'
+    WHEN SEGMENT = 'VIP' THEN 'Frequent Traveler'
+    WHEN SEGMENT = 'REGULAR' THEN 'Standard'
+    ELSE 'Unknown'
+  END AS SEGMENT_DESCRIPTION,
+  IS_CURRENT
+FROM DW.DIM_CUSTOMER
+WHERE IS_CURRENT = TRUE;
+
+-- Bus View
+CREATE OR REPLACE VIEW SEMANTIC.VW_BUS AS
+SELECT
+  BUS_SK,
+  BUS_ID,
+  OPERATOR_NAME,
+  BUS_TYPE,
+  SEAT_CAPACITY,
+  BUS_MODEL,
+  REGISTRATION_NO,
+  IN_SERVICE_DATE,
+  STATUS,
+  CASE
+    WHEN SEAT_CAPACITY > 40 THEN 'Large Bus'
+    WHEN SEAT_CAPACITY > 30 THEN 'Medium Bus'
+    WHEN SEAT_CAPACITY > 20 THEN 'Small Bus'
+    ELSE 'Mini Bus'
+  END AS BUS_SIZE_CATEGORY,
+  IS_CURRENT
+FROM DW.DIM_BUS
+WHERE IS_CURRENT = TRUE;
+
+-- Route View
+CREATE OR REPLACE VIEW SEMANTIC.VW_ROUTE AS
+SELECT
+  SK_ROUTE,
+  ROUTE_ID,
+  SOURCE_CITY,
+  DEST_CITY,
+  CONCAT(SOURCE_CITY, ' -> ', DEST_CITY) AS ROUTE_DESCRIPTION,
+  DISTANCE_KM,
+  SOURCE_STATE,
+  DEST_STATE,
+  REGION,
+  CASE
+    WHEN DISTANCE_KM > 800 THEN 'Long Distance'
+    WHEN DISTANCE_KM > 400 THEN 'Medium Distance'
+    ELSE 'Short Distance'
+  END AS DISTANCE_CATEGORY
+FROM DW.DIM_ROUTE;
+
+-- Date View
+CREATE OR REPLACE VIEW SEMANTIC.VW_DATE AS
+SELECT
+  SK_DATE,
+  DATE_VALUE AS FULL_DATE,
+  YEAR,
+  QUARTER,
+  MONTH,
+  MONTH_NAME,
+  DAY_NAME,
+  IS_WEEKEND,
+  CASE
+    WHEN IS_WEEKEND = TRUE THEN 'Weekend'
+    ELSE 'Weekday'
+  END AS DAY_TYPE,
+  CASE
+    WHEN MONTH >= 4 THEN YEAR
+    ELSE YEAR - 1
+  END AS FISCAL_YEAR
+FROM DW.DIM_DATE;
+
+-- Main Booking View (All dimensions joined)
+CREATE OR REPLACE VIEW SEMANTIC.VW_BOOKINGS AS
+SELECT
+  F.BOOKING_ID,
+  F.BOOKING_LINE_ID,
+  F.SK_BOOKING_DATE,
+  BD.FULL_DATE AS BOOKING_DATE,
+  BD.YEAR AS BOOKING_YEAR,
+  BD.MONTH_NAME AS BOOKING_MONTH,
+  F.SK_JOURNEY_DATE,
+  JD.FULL_DATE AS JOURNEY_DATE,
+  JD.YEAR AS JOURNEY_YEAR,
+  JD.MONTH_NAME AS JOURNEY_MONTH,
+  JD.DAY_NAME AS JOURNEY_DAY,
+  JD.IS_WEEKEND AS JOURNEY_IS_WEEKEND,
+  F.SK_CUSTOMER,
+  C.CUSTOMER_ID,
+  C.FULL_NAME AS CUSTOMER_NAME,
+  C.SEGMENT AS CUSTOMER_SEGMENT,
+  C.CITY AS CUSTOMER_CITY,
+  C.STATE AS CUSTOMER_STATE,
+  C.SEGMENT_DESCRIPTION,
+  F.SK_ROUTE,
+  R.ROUTE_ID,
+  R.SOURCE_CITY,
+  R.DEST_CITY,
+  R.ROUTE_DESCRIPTION,
+  R.DISTANCE_KM,
+  R.REGION,
+  R.DISTANCE_CATEGORY,
+  F.SK_BUS,
+  BU.BUS_ID,
+  BU.OPERATOR_NAME,
+  BU.BUS_TYPE,
+  BU.SEAT_CAPACITY,
+  BU.BUS_SIZE_CATEGORY,
+  F.DEPARTURE_TIME,
+  F.ARRIVAL_TIME,
+  F.SEAT_TYPE,
+  F.SEAT_NO,
+  F.PASSENGER_COUNT,
+  F.FARE_AMOUNT,
+  F.DISCOUNT_PCT,
+  F.NET_AMOUNT,
+  F.PAYMENT_MODE,
+  F.BOOKING_STATUS,
+  CASE
+    WHEN F.BOOKING_STATUS = 'CANCELLED' THEN TRUE
+    ELSE FALSE
+  END AS IS_CANCELLED,
+  F.FARE_AMOUNT / NULLIF(F.PASSENGER_COUNT, 0) AS FARE_PER_PASSENGER,
+  F.NET_AMOUNT / NULLIF(F.PASSENGER_COUNT, 0) AS NET_PER_PASSENGER
+FROM DW.FACT_BOOKING F
+LEFT JOIN SEMANTIC.VW_DATE BD ON F.SK_BOOKING_DATE = BD.SK_DATE
+LEFT JOIN SEMANTIC.VW_DATE JD ON F.SK_JOURNEY_DATE = JD.SK_DATE
+LEFT JOIN SEMANTIC.VW_CUSTOMER C ON F.SK_CUSTOMER = C.CUSTOMER_SK
+LEFT JOIN SEMANTIC.VW_ROUTE R ON F.SK_ROUTE = R.SK_ROUTE
+LEFT JOIN SEMANTIC.VW_BUS BU ON F.SK_BUS = BU.BUS_SK;
+
+
+/* ============================================================
+   STEP 11: POLICY DOCS & SEARCH (RAG - Keyword Based)
+   ============================================================ */
+
+CREATE OR REPLACE TABLE SEMANTIC.POLICY_DOCS (
+  DOC_ID          STRING,
+  DOC_TYPE        STRING,
+  TITLE           STRING,
+  CONTENT         STRING,
+  VERSION_DATE    DATE
+);
+
+INSERT INTO SEMANTIC.POLICY_DOCS (DOC_ID, DOC_TYPE, TITLE, CONTENT, VERSION_DATE) VALUES
+('DOC001', 'CANCELLATION_POLICY', 'Cancellation & Refund Policy',
+ 'Customers can cancel a booking up to 4 hours before departure for a full refund minus a 5% processing fee. Cancellations made within 4 hours of departure are non-refundable. Refunds are processed within 5-7 business days to the original payment method. VIP segment customers get a reduced processing fee of 2%.',
+ '2026-01-01'),
+
+('DOC002', 'FARE_RULES', 'Fare & Discount Rules',
+ 'Fares vary by bus type: AC Sleeper is priced highest, followed by AC Seater, Non-AC Sleeper, and Non-AC Seater. Discounts up to 20% may apply during promotional periods. Senior citizens get a flat 10% discount. Group bookings of 5 or more passengers get a 15% discount. Discounts cannot be combined.',
+ '2026-01-01'),
+
+('DOC003', 'OPERATOR_SOP', 'Operator Onboarding SOP',
+ 'New bus operators must submit fleet registration documents, insurance certificates, and driver licenses before onboarding. Buses are inspected for safety compliance every 6 months. Operators must maintain a minimum on-time performance of 85% to remain active on the platform. Non-compliant operators receive a warning, followed by suspension after repeated violations.',
+ '2026-01-01'),
+
+('DOC004', 'BAGGAGE_POLICY', 'Baggage Rules',
+ 'Each passenger is allowed one piece of check-in luggage up to 15 kg and one hand bag up to 5 kg, free of charge. Excess baggage beyond this limit is charged at Rs. 50 per kg. Fragile, valuable, or perishable items travel at the owner risk. Operators are not liable for loss or damage to unregistered hand baggage.',
+ '2026-01-01'),
+
+('DOC005', 'GROUP_BOOKING_POLICY', 'Group Booking Terms',
+ 'Group bookings of 5 or more passengers on a single booking qualify for a 15% discount and require advance payment in full at the time of booking. Group bookings cannot be partially cancelled; the entire group booking must be cancelled together and follows the standard cancellation policy. A dedicated support contact is provided for groups of 15 or more.',
+ '2026-01-01'),
+
+('DOC006', 'LOYALTY_PROGRAM', 'Loyalty & Rewards Program',
+ 'REGULAR segment customers earn 1 reward point per Rs. 100 spent. VIP segment customers earn 2 reward points per Rs. 100 spent and get priority boarding. Reward points can be redeemed for a fare discount once a customer accumulates 500 points, equal to Rs. 100 off. Points expire 12 months after they are earned.',
+ '2026-01-01'),
+
+('DOC007', 'SAFETY_POLICY', 'Passenger Safety Guidelines',
+ 'All buses are required to have functioning seat belts, fire extinguishers, and emergency exits clearly marked. Drivers undergo mandatory rest breaks every 4 hours on overnight routes. Passengers must wear seat belts where fitted. Any safety incident must be reported to the operator within 24 hours and is logged for compliance review.',
+ '2026-01-01'),
+
+('DOC008', 'BOOKING_MODIFICATION_POLICY', 'Booking Modification & Rescheduling',
+ 'Passengers can reschedule a booking to a different date or time up to 6 hours before departure, subject to seat availability and a rescheduling fee of Rs. 100. Rescheduling within 6 hours of departure is not permitted and is treated as a cancellation. Only one reschedule is allowed per booking.',
+ '2026-01-01'),
+
+('DOC009', 'CUSTOMER_SUPPORT_POLICY', 'Customer Support & Escalation',
+ 'Customer support is available 24x7 through the app chat and helpline. Standard queries are resolved within 24 hours. Refund and complaint escalations are resolved within 5 business days. Unresolved complaints can be escalated to the regional support manager, and further to the grievance officer if not resolved within 10 business days.',
+ '2026-01-01'),
+
+('DOC010', 'KPI_GLOSSARY', 'Analytics KPI Definitions',
+ 'Total Bookings: Count of all booking lines. Total Revenue: Sum of fare amount multiplied by passenger count. Net Revenue: Sum of fare amount after discount applied. Cancellation Rate: Percentage of bookings with status CANCELLED. Occupancy Rate: Ratio of passengers carried to total seat capacity.',
+ '2026-01-01');
+
+-- Keyword-match search function
+CREATE OR REPLACE FUNCTION SEMANTIC.SEARCH_POLICY(QUESTION STRING)
+RETURNS TABLE (DOC_ID STRING, TITLE STRING, CONTENT STRING, RELEVANCE NUMBER)
+AS
+$$
+  SELECT
+    DOC_ID,
+    TITLE,
+    CONTENT,
+    (SELECT COUNT(*)
+     FROM TABLE(SPLIT_TO_TABLE(LOWER(QUESTION), ' ')) W
+     WHERE LENGTH(W.VALUE) > 3
+       AND W.VALUE NOT IN ('what','when','where','which','does','their','with','from','have','this','that')
+       AND CONTAINS(LOWER(CONTENT), W.VALUE)
+    ) AS RELEVANCE
+  FROM SEMANTIC.POLICY_DOCS
+  ORDER BY RELEVANCE DESC
+  LIMIT 1
+$$;
+
+-- Test searches
+SELECT * FROM TABLE(SEMANTIC.SEARCH_POLICY('What is the refund policy for cancellations?'));
+SELECT * FROM TABLE(SEMANTIC.SEARCH_POLICY('What discount do senior citizens get?'));
+SELECT * FROM TABLE(SEMANTIC.SEARCH_POLICY('How often are buses inspected?'));
+
+
+/* ============================================================
+   STEP 12: VALIDATION & BUSINESS QUERIES
+   ============================================================ */
+
+-- KPI Summary
+SELECT
+  COUNT(DISTINCT BOOKING_ID) AS TOTAL_BOOKINGS,
+  SUM(NET_AMOUNT) AS TOTAL_REVENUE,
+  AVG(NET_AMOUNT) AS AVG_FARE,
+  SUM(CASE WHEN BOOKING_STATUS = 'CANCELLED' THEN 1 ELSE 0 END) AS CANCELLED_BOOKINGS,
+  ROUND(100.0 * SUM(CASE WHEN BOOKING_STATUS = 'CANCELLED' THEN 1 ELSE 0 END) / COUNT(*), 2) AS CANCEL_RATE
+FROM SEMANTIC.VW_BOOKINGS;
+
+-- Top 5 Routes by Revenue
+SELECT
+  ROUTE_DESCRIPTION,
+  COUNT(*) AS BOOKINGS,
+  SUM(NET_AMOUNT) AS REVENUE
+FROM SEMANTIC.VW_BOOKINGS
+WHERE BOOKING_STATUS != 'CANCELLED'
+GROUP BY ROUTE_DESCRIPTION
+ORDER BY REVENUE DESC
+LIMIT 5;
+
+-- Top 5 Operators by Revenue
+SELECT
+  OPERATOR_NAME,
+  COUNT(*) AS BOOKINGS,
+  SUM(NET_AMOUNT) AS REVENUE
+FROM SEMANTIC.VW_BOOKINGS
+WHERE BOOKING_STATUS != 'CANCELLED'
+GROUP BY OPERATOR_NAME
+ORDER BY REVENUE DESC
+LIMIT 5;
+
+-- Monthly Revenue Trend
+SELECT
+  JOURNEY_YEAR,
+  JOURNEY_MONTH,
+  COUNT(*) AS BOOKINGS,
+  SUM(NET_AMOUNT) AS REVENUE
+FROM SEMANTIC.VW_BOOKINGS
+GROUP BY JOURNEY_YEAR, JOURNEY_MONTH
+ORDER BY JOURNEY_YEAR, JOURNEY_MONTH;
+
+-- Customer Segment Performance
+SELECT
+  CUSTOMER_SEGMENT,
+  COUNT(*) AS BOOKINGS,
+  SUM(NET_AMOUNT) AS REVENUE,
+  AVG(NET_AMOUNT) AS AVG_SPEND
+FROM SEMANTIC.VW_BOOKINGS
+WHERE BOOKING_STATUS != 'CANCELLED'
+GROUP BY CUSTOMER_SEGMENT
+ORDER BY REVENUE DESC;
+
+-- Weekend vs Weekday Analysis
+SELECT
+  CASE WHEN JOURNEY_IS_WEEKEND = TRUE THEN 'Weekend' ELSE 'Weekday' END AS DAY_TYPE,
+  COUNT(*) AS BOOKINGS,
+  SUM(NET_AMOUNT) AS REVENUE,
+  AVG(NET_AMOUNT) AS AVG_FARE
+FROM SEMANTIC.VW_BOOKINGS
+WHERE BOOKING_STATUS != 'CANCELLED'
+GROUP BY JOURNEY_IS_WEEKEND
+ORDER BY JOURNEY_IS_WEEKEND;
+
+
+/* ============================================================
+   END OF SCRIPT
+   ============================================================ */
