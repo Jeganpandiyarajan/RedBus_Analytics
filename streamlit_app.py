@@ -1,4 +1,4 @@
-# RedBus Analytics Dashboard - Complete Version
+# RedBus Analytics Dashboard - Complete Version (dbt GOLD layer)
 # Streamlit App for Bus Booking Analytics
 
 import streamlit as st
@@ -24,7 +24,7 @@ st.sidebar.header("Filters")
 # Date Range Filter
 date_query = """
 SELECT DISTINCT JOURNEY_DATE 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY JOURNEY_DATE
 """
 date_df = session.sql(date_query).to_pandas()
@@ -41,7 +41,7 @@ date_range = st.sidebar.date_input(
 # Route Filter
 route_query = """
 SELECT DISTINCT ROUTE_DESCRIPTION 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY ROUTE_DESCRIPTION
 """
 route_df = session.sql(route_query).to_pandas()
@@ -51,7 +51,7 @@ selected_route = st.sidebar.selectbox("Select Route", route_options)
 # Operator Filter
 operator_query = """
 SELECT DISTINCT OPERATOR_NAME 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY OPERATOR_NAME
 """
 operator_df = session.sql(operator_query).to_pandas()
@@ -61,7 +61,7 @@ selected_operator = st.sidebar.selectbox("Select Operator", operator_options)
 # Bus Type Filter
 bus_type_query = """
 SELECT DISTINCT BUS_TYPE 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY BUS_TYPE
 """
 bus_type_df = session.sql(bus_type_query).to_pandas()
@@ -71,7 +71,7 @@ selected_bus_type = st.sidebar.selectbox("Select Bus Type", bus_type_options)
 # Customer Segment Filter
 segment_query = """
 SELECT DISTINCT CUSTOMER_SEGMENT 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY CUSTOMER_SEGMENT
 """
 segment_df = session.sql(segment_query).to_pandas()
@@ -81,7 +81,7 @@ selected_segment = st.sidebar.selectbox("Select Customer Segment", segment_optio
 # Payment Mode Filter
 payment_query = """
 SELECT DISTINCT PAYMENT_MODE 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY PAYMENT_MODE
 """
 payment_df = session.sql(payment_query).to_pandas()
@@ -91,7 +91,7 @@ selected_payment = st.sidebar.selectbox("Select Payment Mode", payment_options)
 # Booking Status Filter
 status_query = """
 SELECT DISTINCT BOOKING_STATUS 
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS 
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS 
 ORDER BY BOOKING_STATUS
 """
 status_df = session.sql(status_query).to_pandas()
@@ -147,7 +147,7 @@ SELECT
     DISTANCE_KM,
     REGION,
     SEAT_CAPACITY
-FROM REDBUS_ANALYTICS.SEMANTIC.VW_BOOKINGS
+FROM REDBUS_ANALYTICS.GOLD.VW_BOOKINGS
 WHERE {where_clause}
 """
 
